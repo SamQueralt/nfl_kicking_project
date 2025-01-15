@@ -1,0 +1,903 @@
+---
+title: "NFL Kicking Project"
+author: "Sam Queralt"
+format:
+  html:
+    embed-resources: true
+---
+
+This page documents my methods and thought process in this project. It also includes the code I used for my analysis. Note that many of the charts and models presented here are not present in my paper. As I progressed, the models got increasingly complex. Skip to the [Zone-Based Model](#zone-based-model) if you are interested in my final model.
+
+#### Libraries
+
+I used the following libraries required for data wrangling and analysis.
+
+```{r, warning=FALSE, cache=TRUE}
+library(dplyr, warn.conflicts = FALSE)
+library(ggplot2)
+library(ggrepel)
+library(stringr)
+library(tidyr)
+library(patchwork)
+library(knitr)
+library(kableExtra, warn.conflicts = FALSE)
+library(caret)
+library(randomForest)
+library(neuralnet)
+library(fitdistrplus)
+library(nflfastR)
+library(nflreadr)
+```
+
+### Data
+
+#### Play by play
+
+I imported play by play data for 2022. After filtering it down to exclusively field goals, I exported a csv file to open in excel. In excel, I manually charted the ball location, hash mark orientation, and dominant leg for every kick.
+
+```{r, cache = TRUE}
+stad = read.csv("NFL Kicking Project - Stadiums.csv")
+
+pbp = load_pbp(2022)
+
+kicks = pbp %>%
+  filter(play_type == "field_goal") %>%
+  transform(Kicker = gsub("^.*?(\\S+\\.\\S+)\\s+\\d+.*$", "\\1", desc),
+            Number = as.numeric(gsub("^.*?(\\d+)-\\S+\\s+\\d+.*$", "\\1", desc)),
+            Yards = as.numeric(gsub("^.*?(\\d+) yard.*$", "\\1", desc)),
+            Outcome = ifelse(grepl("is GOOD", desc), "Good", (ifelse(grepl("is BLOCKED", desc), 'Blocked', 'No Good')))) %>%
+  transform(Kicker = sub("\\d+-([^.]+)\\.([^.]+)", "\\1. \\2", Kicker)) %>%
+  dplyr::select(play_id, game_id, Number, Kicker, Yards, Outcome, posteam, defteam, game_date, qtr, quarter_seconds_remaining, yardline_100, desc, home_team, away_team, start_time, stadium, time_of_day)
+
+kicks = kicks %>% 
+  left_join(stad, by = c('stadium' = 'Stadium')) %>%
+  distinct(play_id, game_id, .keep_all = TRUE)
+
+write.csv(kicks, "kicks_2022_2023.csv", row.names = FALSE)
+
+### Old Version
+# pbp = read.csv("pbp-2022.csv")
+# 
+# kicks_2022 = pbp %>%
+#   filter(PlayType == "FIELD GOAL") %>%
+#   transform(Kicker = gsub("^.*?(\\S+\\.\\S+)\\s+\\d+.*$", "\\1", Description),
+#             Number = as.numeric(gsub("^.*?(\\d+)-\\S+\\s+\\d+.*$", "\\1", Description)),
+#             Yards = as.numeric(gsub("^.*?(\\d+) YARD.*$", "\\1", Description)),
+#             Outcome = ifelse(grepl("IS GOOD", Description), "Good", "No Good")) %>%
+#   transform(Kicker = sub("\\d+-([^.]+)\\.([^.]+)", "\\1. \\2", Kicker)) %>%
+#   dplyr::select(Number, Kicker, Yards, Outcome, OffenseTeam, DefenseTeam, GameDate, Quarter, Minute, Second, YardLine, YardLineFixed)
+# 
+# write.csv(kicks_2022, "kicks_2022.csv", row.names = FALSE)
+```
+
+#### Weather data and more
+
+In Python, I gathered the weather data (elevation, temperature, wind speed, wind gusts, and precipitation) for every game using OpenMeteo's API and the precise latitude and longitude of each game. Also, note that some stadiums play indoors, so I set them at a 'room temperature' benchmark. I added salary data, a distinction between grass and turf fields, and extra point percentage. I filtered out the blocked field goals (they are objective outliers that disrupt the models) and added an absolute value column for the X coordinate. Then, I imported the finalized data set into R.
+
+```{r, cache=TRUE}
+final = read.csv("final_kick_data_2022.csv")
+
+# filter out blocks, add factor col, add abs val col
+final = final %>% 
+  filter(Outcome != 'Blocked') %>% 
+  mutate(f_outcome = factor(Outcome)) %>%
+  mutate(dist_X = abs(as.numeric(make_x)))
+```
+
+### Initial Charts and Baseline Analysis
+
+To get a grasp of the data, here is an overlay of each kick location on a graph of the uprights. 
+```{r, echo = FALSE, cache=TRUE, warning=FALSE}
+plot_1 = ggplot(final, aes(x = make_x, y = make_y)) +
+  geom_segment(aes(x = -9.25, y = 0, xend = 9.25, yend = 0), colour = "gold2", linewidth = 1.2) +  
+  geom_segment(aes(x = 0, y = 0, xend = 0, yend = -10), colour = "gold2", linewidth = 1.2) +  
+  geom_segment(aes(x = -9.25, y = 0, xend = -9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+  geom_segment(aes(x = 9.25, y = 0, xend = 9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+  geom_point(alpha = 0.3, size = 1) + 
+  scale_x_continuous(limits = c(-45, 45), expand = c(0.05, 2)) +  
+  scale_y_continuous(limits = c(-10, 40), expand = c(0.05, 2)) +
+  labs(x = '', y = '', title = 'All Kicks') + 
+  theme_void()+
+  theme_minimal() +
+  theme(aspect.ratio = .5)
+  # geom_segment(aes(x = final_med, y = 0, xend = final_med, yend = 35), colour = "steelblue", linewidth = 1.2)
+
+plot_1
+```
+
+Here is a graph filtered by hash mark to observe kickers' tendencies based on their orientation. The blue lines indicate the median X coordinate of the kicks in that subset.
+```{r, echo = FALSE, cache=TRUE, warning=FALSE}
+left_hash = final %>% filter(hash == -9.25)
+right_hash = final %>% filter(hash == 9.25)
+center = final %>% filter(hash == 0)
+
+final_med = median(as.numeric(final$make_x), na.rm = TRUE)
+left_hash_med = median(as.numeric(left_hash$make_x), na.rm = TRUE)
+right_hash_med = median(as.numeric(right_hash$make_x), na.rm = TRUE)
+center_med = median(as.numeric(center$make_x), na.rm = TRUE)
+
+
+plot_2 = ggplot(left_hash, aes(x = make_x, y = make_y)) +
+  geom_segment(aes(x = -9.25, y = 0, xend = 9.25, yend = 0), colour = "gold2", linewidth = 1) +  
+  geom_segment(aes(x = 0, y = 0, xend = 0, yend = -10), colour = "gold2", linewidth = 1) +  
+  geom_segment(aes(x = -9.25, y = 0, xend = -9.25, yend = 35), colour = "gold2", linewidth = 1) + 
+  geom_segment(aes(x = 9.25, y = 0, xend = 9.25, yend = 35), colour = "gold2", linewidth = 1) + 
+  geom_point(alpha = 0.4, size = .7) + 
+  scale_x_continuous(limits = c(-18, 18), expand = c(0.05, 2)) +  
+  scale_y_continuous(limits = c(-10, 40), expand = c(0.05, 2)) +
+  labs(x = '', y = '', title = 'Left Hash') + 
+  theme_void()+
+  theme_minimal() + 
+  geom_segment(aes(x = left_hash_med, y = 0, xend = left_hash_med, yend = 35), colour = "steelblue", linewidth = .9)
+
+plot_3 = ggplot(right_hash, aes(x = make_x, y = make_y)) +
+  geom_segment(aes(x = -9.25, y = 0, xend = 9.25, yend = 0), colour = "gold2", linewidth = 1) +  
+  geom_segment(aes(x = 0, y = 0, xend = 0, yend = -10), colour = "gold2", linewidth = 1) +  
+  geom_segment(aes(x = -9.25, y = 0, xend = -9.25, yend = 35), colour = "gold2", linewidth = 1) + 
+  geom_segment(aes(x = 9.25, y = 0, xend = 9.25, yend = 35), colour = "gold2", linewidth = 1) + 
+  geom_point(alpha = 0.4, size = .7) + 
+  scale_x_continuous(limits = c(-18, 18), expand = c(0.05, 2)) +  
+  scale_y_continuous(limits = c(-10, 40), expand = c(0.05, 2)) +
+  labs(x = '', y = '', title = 'Right Hash') + 
+  theme_void()+
+  theme_minimal() +
+  geom_segment(aes(x = right_hash_med, y = 0, xend = right_hash_med, yend = 35), colour = "steelblue", linewidth = .9) 
+
+plot_4 = ggplot(center, aes(x = make_x, y = make_y)) +
+  geom_segment(aes(x = -9.25, y = 0, xend = 9.25, yend = 0), colour = "gold2", linewidth = 1) +  
+  geom_segment(aes(x = 0, y = 0, xend = 0, yend = -10), colour = "gold2", linewidth = 1) +  
+  geom_segment(aes(x = -9.25, y = 0, xend = -9.25, yend = 35), colour = "gold2", linewidth = 1) + 
+  geom_segment(aes(x = 9.25, y = 0, xend = 9.25, yend = 35), colour = "gold2", linewidth = 1) + 
+  geom_point(alpha = 0.4, size = .7) + 
+  scale_x_continuous(limits = c(-18, 18), expand = c(0.05, 2)) +  
+  scale_y_continuous(limits = c(-10, 40), expand = c(0.05, 2)) +
+  labs(x = '', y = '', title = 'Center') + 
+  theme_minimal() +
+  geom_segment(aes(x = center_med, y = 0, xend = center_med, yend = 35), colour = "steelblue", linewidth = .9)
+
+grid_layout = plot_2 + plot_3 + plot_layout(ncol = 2, nrow = 1)
+grid_layout
+# grid_layout_2 = plot_1 + grid_layout + plot_layout(ncol = 1, nrow = 2)
+
+# ggsave('grid_kicks.png', plot = grid_layout)
+```
+
+##### Simple Coordinate-based Accuracy score
+
+The mean of the absolute value of the X coordinate should indicate how close to the center any given kicker is able to get. Assuming that the kickers always aim for the middle of the uprights (an X coordinate of 0), the lowest mean would correspond to the most accurate kicker. Since mean is easily swayed by outliers, I filtered out the worst misses. These uncharacteristic shanks are often caused by others' mistakes (bad hold, untimely snap, bad blocking, etc.), and do not provide much information about the kicker themselves. Also, I set the minimum number of kicks to ten to weed out the backups.
+
+```{r, warning = FALSE, cache=TRUE}
+median_kicks_acc = final %>%
+  filter(dist_X < 20) %>%
+  group_by(Kicker) %>%
+  filter(n() > 10) %>%
+  summarise(MeanX = round(mean(dist_X), 2)) %>%
+  arrange(MeanX)
+```
+
+```{r, warning = FALSE, cache=TRUE, echo=FALSE}
+med_subset <- rbind(head(median_kicks_acc, 3), data.frame(Kicker = c('...'),  MeanX = c('...')) ,tail(median_kicks_acc, 2))
+
+median_kicks_acc = med_subset %>%
+  kable(format = 'html') %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  column_spec(1, bold = TRUE, color = "steelblue") %>%
+  row_spec(0, background = "#D3D3D3")
+
+median_kicks_acc
+```
+
+```{r, echo = FALSE, warning=FALSE, cache=TRUE}
+kicker_specific = final %>%
+  filter(Kicker == 'G. Zuerlein')
+
+plot_1 = ggplot(kicker_specific, aes(x = make_x, y = make_y)) +
+  geom_segment(aes(x = -9.25, y = 0, xend = 9.25, yend = 0), colour = "gold2", linewidth = 1.2) +  
+  geom_segment(aes(x = 0, y = 0, xend = 0, yend = -10), colour = "gold2", linewidth = 1.2) +  
+  geom_segment(aes(x = -9.25, y = 0, xend = -9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+  geom_segment(aes(x = 9.25, y = 0, xend = 9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+  geom_point(alpha = 0.8, aes(color = dist_X)) + 
+  scale_color_gradient(low = 'chartreuse4', high = 'red') +
+  scale_x_continuous(limits = c(-20, 20), expand = c(0.05, 2)) +  
+  scale_y_continuous(limits = c(-10, 40), expand = c(0.05, 2)) +
+  labs(x = '', y = '', title = 'Least Accurate: Greg Zuerlein') + 
+  theme_minimal() +
+  theme(legend.position = 'none') 
+
+kicker_specific = final %>%
+  filter(Kicker == 'J. Myers')
+
+plot_2 = ggplot(kicker_specific, aes(x = make_x, y = make_y)) +
+  geom_segment(aes(x = -9.25, y = 0, xend = 9.25, yend = 0), colour = "gold2", linewidth = 1.2) +  
+  geom_segment(aes(x = 0, y = 0, xend = 0, yend = -10), colour = "gold2", linewidth = 1.2) +  
+  geom_segment(aes(x = -9.25, y = 0, xend = -9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+  geom_segment(aes(x = 9.25, y = 0, xend = 9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+  geom_point(alpha = 0.8, aes(color = dist_X)) + 
+  scale_color_gradient(low = 'chartreuse4', high = 'red') +
+  scale_x_continuous(limits = c(-20, 20), expand = c(0.05, 2)) +  
+  scale_y_continuous(limits = c(-10, 40), expand = c(0.05, 2)) +
+  labs(x = '', y = '', title = 'Most Accurate: Jason Myers') + 
+  theme_minimal() +
+  theme(legend.position = 'none')
+
+grid_layout = plot_2 + plot_1 + plot_layout(ncol = 2, nrow = 1)
+grid_layout
+```
+
+#### Simple Distance-based Accuracy Score
+
+This version of accuracy measurement does not involve coordinates. Rather, it uses the binary outcome of each kick to determine the probability of a make from that distance. If a kicker makes the kick, they receive a score of $1 - P(\text{success})$. If they miss, they receive a score of $0 - P(\text{success})$. The probability of success is determined by $\frac{\text{Number of Successes}}{\text{Number of Field Goal Attempts}}$ in each 5 yard range. 
+
+```{r, cache=TRUE, warning=FALSE}
+# first get % by range
+fg_perc_yds = final %>%
+  group_by(Yards) %>%
+  mutate(Bin = cut(Yards, 
+                   breaks = seq(15, max(Yards) + 5, 5), 
+                   include.lowest = FALSE, 
+                   right = FALSE))
+
+binned_fg_perc = fg_perc_yds %>%
+  group_by(Bin) %>%
+  summarise(fg_perc = mean(Outcome == 'Good', na.rm = TRUE)) %>%
+  arrange(-Bin)
+
+# assign fg % for each kick  
+fg_perc_yds = fg_perc_yds %>%
+  left_join(binned_fg_perc, by = "Bin") %>%
+  arrange(-fg_perc) %>%
+  mutate(FGOE = ifelse(Outcome == 'Good', 1 - fg_perc, 0 - fg_perc))
+
+kicker_fgoe = fg_perc_yds %>%
+  group_by(Kicker) %>%
+  filter(n() > 10) %>%
+  summarise(FGOE = sum(FGOE)) %>% 
+  arrange(-FGOE)
+```
+
+```{r, cache=TRUE, warning=FALSE, echo=FALSE}
+plot_1 = ggplot(binned_fg_perc, aes(x = Bin, y = fg_perc)) +
+  geom_bar(stat = 'identity', aes(fill = fg_perc)) + 
+  scale_fill_gradient(low = "red", high = "chartreuse4") +
+  labs(y = 'Probabilty of Success', x = 'Yard Range', title = 'Difficulty by Distance') +
+  theme(legend.position = "none")
+
+plot_2 = ggplot(kicker_fgoe, aes(x = reorder(Kicker, FGOE), y = FGOE)) +
+  geom_bar(stat = 'identity', aes(fill = FGOE)) + 
+  scale_fill_gradient(low = "red", high = "chartreuse4") +
+  theme(axis.text.x = element_text(angle = 55, hjust = 1)) +
+  labs(title = "Field Goals Over Expected by Kicker (% based)", x = "Kicker", y = "FGOE") +
+  theme(legend.position = "none")
+
+plot_1
+plot_2
+```
+
+#### Combining Distance and X Coordinate Accuracy
+
+I used the last two models to produce a more complete idea of accuracy. The formula $\text{Distance from center } \times \text{Probability of Success}$ returns a low score for impressive kicks and a high score for poor kicks. I took the median for each kicker and then applied a percentile that indicates how accurate that kicker was this season.
+
+```{r, cache=TRUE}
+accuracy_model_prelim = fg_perc_yds %>% 
+  mutate(Grade = abs(as.numeric(make_x, na.rm = TRUE)) * fg_perc, na.rm = TRUE) %>%
+  group_by(Kicker) %>%
+  filter(n() > 5) %>%
+  summarise(Raw = median(Grade, na.rm = TRUE), Kicks = n()) %>% 
+  arrange(Raw) %>%
+  mutate(Accuracy = 100 - (round(percent_rank(Raw) * 100, 2))) %>%
+  arrange(-Accuracy)
+```
+
+```{r, cache=TRUE, echo = FALSE}
+med_subset <- rbind(head(accuracy_model_prelim, 3), data.frame(Kicker = c('...'),  
+                                                     Raw = c('...'),
+                                                     Kicks = c('...'),
+                                                     Accuracy = c('...')), tail(accuracy_model_prelim, 2))
+
+med_subset %>%
+  kable(format = 'html') %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  column_spec(1, bold = TRUE, color = "steelblue") %>%
+  row_spec(0, background = "#D3D3D3")
+```
+
+### Model Building
+While the above model does an alright job of encapsulating kicker performance, it is much too simple to accurately gauge the best kickers.
+
+#### Training and Testing data
+
+First, I set aside training and testing data with an 80-20 split.
+
+```{r,cache=TRUE, warning=FALSE}
+set.seed(1)
+data_split = createDataPartition(final$Yards, p = 0.8, list = FALSE)
+fg_train = final[data_split, ]
+fg_test = final[-data_split, ]
+```
+
+#### Logistic Model
+
+Then, I created a logistic model to predict the outcome of a kick based on distance. As seen below, this model predicts exclusively made field goals on the test data. This is because coaches generally do not allow their kickers to take field goals that they expect them to miss. However, a model that exclusively predicts successes is not very useful. Rather, it could more useful to model kick power and accuracy separately.
+
+```{r, cache=TRUE, warning=FALSE}
+outcome_glm = train(
+  form = Outcome ~ Yards,
+  data = fg_train,
+  trControl = trainControl(method = "cv", number = 5),
+  preProc = c("nzv", "range"),
+  method = "glm",
+  family = binomial
+)
+```
+
+```{r, cache=TRUE, echo=FALSE, warning=FALSE}
+predictions = predict(outcome_glm, newdata = fg_test)
+
+result_df = data.frame(Predicted = predictions, Actual = fg_test$Outcome)
+
+pivot_table = result_df %>%
+  group_by(Predicted, Actual) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  rbind(data.frame(Predicted = 'No Good', Actual = 'Good', count = 0)) %>%
+  rbind(data.frame(Predicted = 'No Good', Actual = 'No Good', count = 0)) %>%
+  spread(Actual, count, fill = 0) %>%
+  kable(format = "html", align = "c") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE, position = "center")
+
+pivot_table
+```
+
+#### Accuracy Linear model
+
+This model is built under the assumption that kickers are aiming for the center of the uprights (an X coordinate of 0). I built  the model to predict the distance from the center based on the distance of the kick. Then, I calculated the ratio between the recorded and predicted distances from the center. Thus a ratio less than one implies that a kick was closer to the center than predicted. The kicker with the lowest median ratio is determined to be the most accurate kicker, as is reflected by the percentile. The graphs show all the kicks of the best and worst kickers with a line connecting their kick to its predicted X coordinate. The line is green for a kick that is more accurate than expected and red otherwise.
+
+```{r, cache=TRUE}
+accuracy_glm = glm(dist_X ~ poly(Yards, 2) + elevation + windspeed, data = fg_train)
+
+rmse = sqrt(mean((fg_test$dist_X - predict(accuracy_glm, newdata = fg_test))^2))
+
+accuracy_model = final %>%
+  mutate(acc_vs_exp = dist_X / predict(accuracy_glm, data.frame(Yards, elevation, windspeed))) %>%
+  group_by(Kicker) %>%
+  filter(n() > 10) %>%
+  summarize(acc_vs_exp = median(acc_vs_exp), Kicks = n()) %>%
+  arrange(acc_vs_exp) %>%
+  mutate(Accuracy = 100 - round(percent_rank(acc_vs_exp) * 100, 2))
+```
+
+```{r, cache=TRUE, echo=FALSE, warning=FALSE}
+med_subset <- rbind(head(accuracy_model, 3), data.frame(Kicker = c('...'),  
+                                                     acc_vs_exp = c('...'),
+                                                     Kicks = c('...'),
+                                                     Accuracy = c('...')), tail(accuracy_model, 2))
+
+med_subset %>%
+  kable(format = 'html') %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  column_spec(1, bold = TRUE, color = "steelblue") %>%
+  row_spec(0, background = "#D3D3D3")
+
+color_scale <- scale_color_manual(values = c("red" = "firebrick2", "green" = "chartreuse4"))
+
+aplot_1 = final %>%
+  filter(Kicker == 'J. Myers') %>%
+  mutate(Predicted_X = predict(accuracy_glm, data.frame(Yards, elevation, windspeed)),
+         diff_X = Predicted_X / dist_X) %>%
+  ggplot(aes(x = make_x, y = make_y)) +
+    geom_segment(aes(x = -9.25, y = 0, xend = 9.25, yend = 0), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = 0, y = 0, xend = 0, yend = -10), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = -9.25, y = 0, xend = -9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    geom_segment(aes(x = 9.25, y = 0, xend = 9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    geom_segment(aes(x = make_x, xend = ifelse(make_x > 0, Predicted_X, -1 * Predicted_X), yend = make_y, 
+                     color = ifelse(diff_X < 1, "red", "green")), 
+                     linewidth = .7, alpha = .5, show.legend = FALSE) +  
+    geom_point(aes(color = ifelse(diff_X < 1, "red", "green")), size  = 1.5, show.legend = FALSE) +
+#    geom_point(aes(y = Predicted_Y), color = "black", size = .7) + 
+    color_scale +
+    labs(x = '', y = '', title = 'Most Accurate: Jason Myers') +
+    theme_minimal() +
+    xlim(c(-20, 20)) +
+    ylim(c(-10, 40))
+
+aplot_2 = final %>%
+  filter(Kicker == 'M. Wright') %>%
+  mutate(Predicted_X = predict(accuracy_glm, data.frame(Yards, elevation, windspeed)),
+         diff_X = Predicted_X / dist_X) %>%
+  ggplot(aes(x = make_x, y = make_y)) +
+    geom_segment(aes(x = -9.25, y = 0, xend = 9.25, yend = 0), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = 0, y = 0, xend = 0, yend = -10), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = -9.25, y = 0, xend = -9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    geom_segment(aes(x = 9.25, y = 0, xend = 9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    geom_segment(aes(x = make_x, xend = ifelse(make_x > 0, Predicted_X, -1 * Predicted_X), yend = make_y, 
+                     color = ifelse(diff_X < 1, "red", "green")), 
+                     linewidth = .7, alpha = .5, show.legend = FALSE) +  
+    geom_point(aes(color = ifelse(diff_X < 1, "red", "green")), size  = 1.5, show.legend = FALSE) +
+#    geom_point(aes(y = Predicted_Y), color = "black", size = .7) + 
+    color_scale +
+    labs(x = '', y = '', title = 'Least Accurate: Matt Wright') +
+    theme_minimal() +
+    xlim(c(-20, 20)) +
+    ylim(c(-10, 40))
+
+grid_layout = aplot_1 + aplot_2 + plot_layout(ncol = 2, nrow = 1)
+grid_layout
+```
+
+#### Power Linear Model
+
+Similarly, I constructed a model that predicts the Y coordinate of a kick based on the distance. The difference between the predicted Y and the actual Y indicates how strong the kick actually was. I took the median of this value for each kicker to produce a percentile that determined who has the strongest leg. The graphs show all the kicks of the best and worst kickers with a line connecting their kick to its predicted Y coordinate. Similar to before, the line is green for a kick that is more powerful than expected and red otherwise.
+
+```{r, cache=TRUE}
+power_glm = glm(make_y ~ poly(Yards, 2) + elevation + windspeed, data = fg_train)
+
+rmse = sqrt(mean((fg_test$make_y - predict(power_glm, newdata = fg_test))^2))
+
+power_model = final %>% 
+  mutate(pwr_over_exp = make_y - predict(power_glm, data.frame(Yards, elevation, windspeed)),
+         long_50 = ifelse(Yards >= 50, 1, 0)) %>%
+  group_by(Kicker) %>%
+  filter(n() > 10) %>%
+  summarize(pwr_over_exp = median(pwr_over_exp), Salary = mean(cap_hit), Long = sum(long_50)) %>%
+  arrange(-pwr_over_exp) %>%
+  mutate(Power = round(percent_rank(pwr_over_exp) * 100, 2))
+```
+
+```{r, cache=TRUE, echo = FALSE, warning=FALSE}
+med_subset <- rbind(head(power_model, 3), data.frame(Kicker = c('...'),  
+                                                     pwr_over_exp = c('...'),
+                                                     Salary = c('...'),
+                                                     Long = c('...'),
+                                                     Power = c('...')), tail(power_model, 2))
+
+med_subset %>%
+  kable(format = 'html') %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  column_spec(1, bold = TRUE, color = "steelblue") %>%
+  row_spec(0, background = "#D3D3D3")
+
+color_scale <- scale_color_manual(values = c("red" = "firebrick2", "green" = "chartreuse4"))
+
+pplot_1 = final %>%
+  filter(Kicker == 'M. Prater') %>%
+  mutate(Predicted_Y = predict(power_glm, data.frame(Yards, elevation, windspeed)),
+         diff_Y = make_y - Predicted_Y) %>%
+  ggplot(aes(x = make_x, y = make_y)) +
+    geom_segment(aes(x = -9.25, y = 0, xend = 9.25, yend = 0), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = 0, y = 0, xend = 0, yend = -10), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = -9.25, y = 0, xend = -9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    geom_segment(aes(x = 9.25, y = 0, xend = 9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    geom_segment(aes(xend = make_x, yend = Predicted_Y, color = ifelse(diff_Y < 0, "red", "green")), 
+                 linewidth = .7, alpha = .5, show.legend = FALSE) +  
+    geom_point(aes(color = ifelse(diff_Y < 0, "red", "green")), size  = 1.5, show.legend = FALSE) +
+#    geom_point(aes(y = Predicted_Y), color = "black", size = .7) + 
+    color_scale +
+    labs(x = '', y = '', title = 'Most Powerful: Matt Prater') +
+    theme_minimal() +
+    xlim(c(-20, 20)) +
+    ylim(c(-10, 40))
+
+pplot_2 = final %>%
+  filter(Kicker == 'M. Crosby') %>%
+  mutate(Predicted_Y = predict(power_glm, data.frame(Yards, elevation, windspeed)),
+         diff_Y = make_y - Predicted_Y) %>%
+  ggplot(aes(x = make_x, y = make_y)) +
+    geom_segment(aes(x = -9.25, y = 0, xend = 9.25, yend = 0), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = 0, y = 0, xend = 0, yend = -10), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = -9.25, y = 0, xend = -9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    geom_segment(aes(x = 9.25, y = 0, xend = 9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    geom_segment(aes(xend = make_x, yend = Predicted_Y, color = ifelse(diff_Y < 0, "red", "green")), 
+                 linewidth = .7, alpha = .5, show.legend = FALSE) +  
+    geom_point(aes(color = ifelse(diff_Y < 0, "red", "green")), size  = 1.5, show.legend = FALSE) +
+#    geom_point(aes(y = Predicted_Y), color = "black", size = .7) + 
+    color_scale + 
+    labs(x = '', y = '', title = 'Least Powerful: Mason Crosby') + 
+    theme_minimal() + 
+    xlim(c(-20, 20)) +
+    ylim(c(-10, 40))
+
+grid_layout = pplot_1 + pplot_2 + plot_layout(ncol = 2, nrow = 1)
+grid_layout
+
+# ggsave("power_comparison.png", grid_layout, width = 6, height = 4)
+```
+
+#### Composite Score
+
+Using the metrics calculated above, I created a composite score for each kicker. To do this, I simply added the accuracy and power percentiles. Since accuracy is a more important factor than power (according to coach input), I weighed power at 30% less than accuracy (resulting in a maximum composite score of 170). This composite is a good indicator of kicking prowess. However, for a more complete score, it is important to adjust for how many kicks a kicker attempted. To factor volume in, I created a multiplier from .6 to 1 that reflects the number of kicks attempted. I adjusted the composite score by subtracting the median composite. Now, factoring in the volume multiplier results in a regression to the median based on how many kicks a given kicker attempted. This final score is called VolComp. I discuss the many issues with this model in the paper, but it does a fair job at identifying talented kickers.
+
+```{r, cache=TRUE, warning=FALSE}
+comp = full_join(power_model, accuracy_model, by = "Kicker") %>%
+  mutate(Composite = (.7 * Power) + Accuracy) %>%
+  dplyr::select(Kicker, Kicks, Power, Accuracy, Composite, Salary, Long) %>%
+  arrange(-Composite)
+
+comp_volume = comp %>% 
+  mutate(Volume = percent_rank(Kicks)) %>%
+  mutate(Long = percent_rank(Long)) %>%
+  mutate(Adj_Vol = .5 + (.3 * Long) + (.2 * Volume)) %>%
+  mutate(Composite = Composite - median(Composite)) %>%
+  mutate(Volcomp = Adj_Vol * Composite) %>%
+  dplyr::select(Kicker, Kicks, Power, Accuracy, Adj_Vol, Volcomp, Salary) %>%
+  arrange(-Volcomp)
+```
+
+```{r, cache=TRUE, warning=FALSE, echo = FALSE}
+med_subset <- rbind(head(comp_volume, 3), data.frame(Kicker = c('...'),  
+                                                     Kicks = c('...'),
+                                                     Power = c('...'),
+                                                     Accuracy = c('...'),
+                                                     Salary = c('...'),
+                                                     Adj_Vol = c('...'),
+                                                     Volcomp = c('...')), tail(comp_volume, 2))
+
+med_subset %>%
+  kable(format = 'html') %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  column_spec(1, bold = TRUE, color = "steelblue") %>%
+  row_spec(0, background = "#D3D3D3")
+
+# adjust salary
+comp_volume_2 = comp_volume %>% mutate(`Salary (millions)` = Salary / 1000000)
+
+volcomp_plot = ggplot(comp_volume_2, aes(x = Volcomp, y = `Salary (millions)`)) + 
+  geom_rect(aes(xmin = median(Volcomp), xmax = Inf, ymin = median(`Salary (millions)`, na.rm = TRUE), ymax = Inf), 
+            fill = "gold1", alpha = .01) + 
+  geom_rect(aes(xmin = median(Volcomp), xmax = Inf, ymin = -Inf, ymax = median(`Salary (millions)`, na.rm = TRUE)), 
+            fill = "springgreen4", alpha = .01) + 
+  geom_rect(aes(xmin = -Inf, xmax = median(Volcomp), ymin = -Inf, ymax = median(`Salary (millions)`, na.rm = TRUE)),
+            fill = "orange", alpha = .01) + 
+  geom_rect(aes(xmin = -Inf, xmax = median(Volcomp), ymin = median(`Salary (millions)`, na.rm = TRUE), ymax = Inf), 
+            fill = "red", alpha = .01) + 
+  geom_point(size = .5) +
+  geom_text_repel(aes(label = Kicker), size = 2.3, box.padding = 0.2) + 
+  theme_minimal() +
+  labs(x = "VolComp", title = "VolComp and Salary of NFL Kickers in 2022")
+
+volcomp_plot
+
+# ggsave('volcomp_plot.png', volcomp_plot)
+```
+
+#### Late-Game VolComp
+
+Some kickers are defined by their ability to hit kicks 'in the clutch.' Here, I filtered the data set down to just field goals attempted in the last four minutes of the fourth quarter or in overtime. Though it is not a perfect distinction, kicks late in games tend to be more important than others. Despite the very small sample size, some kicker's scores still jump off the page. Observe the difference in Evan McPherson's late-game VolComp and his normal VolComp.
+
+```{r, cache=TRUE, echo = FALSE, warning=FALSE}
+acc_late_game = final %>%
+  filter(qtr > 4 | (qtr == 4 & quarter_seconds_remaining <= 240)) %>%
+  mutate(acc_vs_exp = dist_X / predict(accuracy_glm, data.frame(Yards, elevation, windspeed))) %>%
+  group_by(Kicker) %>%
+  summarize(acc_vs_exp = median(acc_vs_exp), Kicks = n()) %>%
+  arrange(acc_vs_exp) %>%
+  mutate(Accuracy = 100 - round(percent_rank(acc_vs_exp) * 100, 2))
+
+pwr_late_game = final %>% 
+  filter(qtr > 4 | (qtr == 4 & quarter_seconds_remaining <= 240)) %>%
+  mutate(pwr_over_exp = make_y - predict(power_glm, data.frame(Yards, elevation, windspeed))) %>%
+  group_by(Kicker) %>%
+  summarize(pwr_over_exp = median(pwr_over_exp), Salary = mean(cap_hit)) %>%
+  arrange(-pwr_over_exp) %>%
+  mutate(Power = round(percent_rank(pwr_over_exp) * 100, 1))
+
+comp_late_game = full_join(pwr_late_game, acc_late_game, by = "Kicker") %>%
+  mutate(Composite = (.7 * Power) + Accuracy) %>%
+  mutate(`Salary (millions)` = Salary / 1000000) %>%
+  dplyr::select(Kicker, Kicks, Power, Accuracy, Composite, `Salary (millions)`) %>%
+  arrange(-Composite)
+
+comp_volume_late_game = comp_late_game %>% 
+  mutate(Volume = percent_rank(Kicks)) %>%
+  mutate(Composite = Composite - median(Composite)) %>%
+  mutate(Volcomp = Volume * Composite) %>%
+  arrange(-Volcomp)
+
+ggplot(comp_volume_late_game, aes(x = Volcomp, y = `Salary (millions)`)) + 
+  geom_rect(aes(xmin = median(Volcomp), xmax = Inf, ymin = median(`Salary (millions)`, na.rm = TRUE), ymax = Inf), 
+            fill = "gold1", alpha = .01) + 
+  geom_rect(aes(xmin = median(Volcomp), xmax = Inf, ymin = -Inf, ymax = median(`Salary (millions)`, na.rm = TRUE)), 
+            fill = "springgreen4", alpha = .01) + 
+  geom_rect(aes(xmin = -Inf, xmax = median(Volcomp), ymin = -Inf, ymax = median(`Salary (millions)`, na.rm = TRUE)),
+            fill = "orange", alpha = .01) + 
+  geom_rect(aes(xmin = -Inf, xmax = median(Volcomp), ymin = median(`Salary (millions)`, na.rm = TRUE), ymax = Inf), 
+            fill = "red", alpha = .01) + 
+  geom_point(size = .5) +
+  geom_text_repel(aes(label = Kicker), size = 2.3, box.padding = 0.2) + 
+  theme_minimal() +
+  labs(x = 'VolComp (above median)', title = "Late-Game Volcomp 2022")
+
+# ggplot(comp_late_game, aes(x = Kicks, y = Composite)) + 
+#   geom_point(size = .5) +
+#   geom_text_repel(aes(label = Kicker), size = 2.3, box.padding = 0.2) + 
+#   theme_minimal()
+```
+
+### Zone-Based Model {#zone-based-model}
+While modeling power and accuracy separately worked fairly well, it ignores much of the nuance involved with kicking. I decided to change my approach again, this time opting to score each kick individually based on location. 
+
+#### Score Assignment
+Observe the map below. Using a process outlined in my paper, every point on the plane is awarded a score between 0 and 1. The green area correspond to high scores, while the magenta areas correspond to low scores.
+
+```{r, cache=TRUE}
+sigmoid = function(x, k, x_0) {
+  1 / (1 + exp(-k * (x - x_0)))
+}
+
+# define score as the minimum of the x score and y score
+zones = final %>%
+  mutate(xs = 1 - sigmoid(abs(make_x), .6, 6),
+         ys = sigmoid(make_y, .25, 7.5),
+         s = pmin(xs, ys))
+```
+
+```{r, cache=TRUE, echo = FALSE}
+splot_map = expand.grid(x = seq(-40, 40),
+                        y = seq(-10, 40)) %>%
+  mutate(xs = 1 - sigmoid(abs(x), .7, 6),
+         ys = sigmoid(y, .25, 7.5),
+         s = pmin(xs, ys)) %>%  
+  ggplot(aes(x = x, y = y)) + 
+    geom_point(aes(color = s), alpha = .7) + 
+    geom_segment(aes(x = -9.25, y = 0, xend = 9.25, yend = 0), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = 0, y = 0, xend = 0, yend = -10), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = -9.25, y = 0, xend = -9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    geom_segment(aes(x = 9.25, y = 0, xend = 9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    scale_color_gradient(low = 'magenta', high = 'green') +
+    labs(x = '', y = '', title = 'Kick Score Map') + 
+    theme_minimal() + 
+    xlim(c(-40, 40)) +
+    ylim(c(-10, 40)) +
+    guides(color = 'none') +
+    theme(
+      panel.grid = element_line(color = "grey30"),  # Change gridline color to black
+      axis.text = element_text(color = "grey70")   # Change axis number (text) color to grey
+    )
+
+ggsave("score_map.png", splot_map, width = 8, height = 6)
+
+splot_map
+```
+
+#### Model Building
+As seen in the code below, I built and tested three types of models: linear, random forest, and neural network. On a ten-fold cross validation, the linear model out-performed the random forest. The neural network performed similarly to the linear model (I did not perform cross validation on the neural network because the training takes more time), but I chose to use the linear model to lessen complexity and preserve explainability. As mentioned in my paper, I did also perform variable selection using ANOVA. However, the results were not useful, so I chose to omit them here.
+```{r, cache = TRUE}
+set.seed(1)
+k = 10  # Number of folds
+folds = createFolds(zones$Yards, k = k, list = TRUE, returnTrain = FALSE)
+sample = sample.int(n = nrow(zones), size = floor(.75*nrow(zones)), replace = F)
+z_train = zones[sample, ]
+z_test = zones[-sample, ]
+
+
+rmse_cv_lm = numeric(k)
+rmse_cv_forest = numeric(k)
+
+for (i in 1:k) {
+  train_index = unlist(folds[-i])
+  test_index = unlist(folds[i])
+  
+  s_lm = lm(s ~ poly(Yards, 2) + elevation + windspeed, data = zones[train_index, ])
+  predictions = predict(s_lm, newdata = zones[test_index, ])
+  rmse_cv_lm[i] = sqrt(mean((zones$s[test_index] - predictions)^2))
+  
+  s_forest = randomForest(s ~ Yards + elevation + windgusts, data = zones[train_index, ], ntree = 500)
+  predictions = predict(s_forest, newdata = zones[test_index, ])
+  rmse_cv_forest[i] = sqrt(mean((zones$s[test_index] - predictions)^2))
+}
+
+s_nn = neuralnet(s ~ Yards + elevation + windspeed, 
+                 z_train, 
+                 hidden=10, 
+                 threshold=0.04, 
+                 act.fct="tanh", 
+                 linear.output=TRUE, 
+                 stepmax=1e7)
+predictions = predict(s_nn, newdata = z_test)
+
+rmse_lm = mean(rmse_cv_lm)
+rmse_forest = mean(rmse_cv_forest)
+rmse_nn = sqrt(mean((z_test$s - predictions)^2))
+```
+
+```{r, cache=TRUE, echo=FALSE}
+data.frame(Model = c('Linear Model','Random Forest','Neural Network'),
+           RMSE = c(round(rmse_lm, 4), round(rmse_forest, 4), round(rmse_nn,4))) %>%
+  kable(format = 'html') %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  column_spec(1, bold = TRUE, color = "steelblue") %>%
+  row_spec(0, background = "#D3D3D3")
+```
+
+#### Difficulty Adjustment
+The next step was to adjust the score of each individual kick to reflect its success relative to its difficulty. To do this, I created a difficulty multiplier based on a sigmoid function of the predicted score of each kick. A lower predicted score corresponds to a higher difficulty multiplier. The multiplier ranges from 0 to 1, and thus only discounts kicks that are easier. Each kick then received an 'adjusted score per kick' value. The graph below displays the difficulty multiplier of each kick based on its predicted score. The red points represent kicks of 50 or more yards. 
+```{r, cache = TRUE}
+zones = zones %>%
+  mutate(s_pred = predict(s_lm, data.frame(Yards, elevation, windspeed)),
+         diff = pmin((sigmoid((1 - s_pred), 10, .5) / 1.25) + .4, 1),
+         s_adj = s * diff)
+
+zones_rank = zones %>%
+  group_by(Kicker) %>%
+  filter(n() > 10) %>%
+  summarize(Salary = mean(cap_hit),
+            Kicks = n(),
+            s_adj = mean(s_adj))
+```
+
+```{r, cache = TRUE, echo=FALSE}
+zones %>% 
+  mutate(long_50 = ifelse(Yards >= 50, 1, 0)) %>%
+  ggplot() + geom_point(aes(s_pred, diff, color = long_50)) +
+    labs(x = 'Predicted Score', y = 'Difficulty Multiplier') + 
+    theme_minimal() + 
+    theme(legend.position = "none") +
+    scale_color_gradient(low = "chartreuse4", high = "firebrick2") + 
+    xlim(c(0, 1)) +
+    ylim(c(0, 1))
+```
+
+This table displays a sample of the most difficult kicks in the data set and their corresponding multiplier.
+```{r, cache = TRUE, echo=FALSE}
+zones %>%
+  dplyr::select(Kicker, Yards, elevation, windspeed, diff, Outcome) %>%
+  arrange(-Yards) %>%
+  arrange(-diff) %>%
+  head(5) %>%
+  kable(format = 'html') %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  column_spec(1, bold = TRUE, color = "steelblue") %>%
+  row_spec(0, background = "#D3D3D3")
+```
+
+#### Volume Adjustment
+Some kickers experienced much higher lower volume than others. This means their scores may not be as indicative of their skill. Since I chose to use a difficulty multiplier in the last step, I can use empirical Bayes method to adjust the score per kick ratios for volume by fitting a Beta distribution to the adjusted scores of each kicker. This is a bit involved, but reduces the chances of kickers over- or under-performing in the model due to less attempts. 
+```{r, cache = TRUE, warning=FALSE}
+fit = fitdistr(zones_rank$s_adj, dbeta, start = list(shape1 = 1, shape2 = 8))
+
+shape1 = fit$estimate["shape1"]
+shape2 = fit$estimate["shape2"]
+
+zones_rank = zones_rank %>%
+  mutate(Score = ((s_adj * Kicks) + shape1) / (Kicks + shape1 + shape2),
+         Score = round(sigmoid(Score, 500, median(Score)) * 100, 2)) %>%
+  dplyr::select(Kicker, Kicks, s_adj, Score) %>% 
+  arrange(-Score)
+```
+
+```{r, cache = TRUE, echo=FALSE}
+ggplot(zones_rank, aes(x = s_adj)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 8, fill = 'royalblue2', color = "royalblue4") +
+  stat_function(fun = dbeta, args = list(shape1, shape2), color = "black", linewidth = .8) +
+  labs(title = "Fitted Beta Distribution", x = "Adjusted Score", y = "Density") +
+  theme_minimal()
+```
+
+After empirical Bayes, the output can be used to create a score from 0 to 100 that indicates the overall performance of each kicker based on the model. In my paper, I discuss the commonalities between the top players in my model. Ideally, coaches can use these kickers as a blueprint for future success. Copying their career paths could be the answer to maximizing an athlete's potential kicking ability. Please note that this list varies slightly from the paper because I have updated the model.
+
+```{r, cache=TRUE, echo = FALSE, warning=FALSE}
+temp = zones_rank %>%
+  dplyr::select(Kicker, Kicks, Score)
+
+med_subset <- rbind(head(temp, 5), data.frame(Kicker = c('...'),  
+                                              Kicks = c('...'),
+                                              Score = c('...')), tail(temp, 2))
+
+med_subset %>%
+  kable(format = 'html') %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  column_spec(1, bold = TRUE, color = "steelblue") %>%
+  row_spec(0, background = "#D3D3D3")
+```
+
+These graphs show the charted attempts of the best and worst performers. Green indicates a higher score than expected, while magenta indicates a lower score than expected. Note that the expectation changes based on the circumstances of the kick, so the kicks that look perfect are not necessarily the highest scorers.
+```{r, cache=TRUE, echo = FALSE, warning=FALSE}
+splot_1 = final %>%
+  filter(Kicker == 'G. Gano') %>%
+  mutate(xs = 1 - sigmoid(abs(make_x), .6, 6),
+         ys = sigmoid(make_y, .25, 7.5),
+         s = pmin(xs, ys),
+         s_pred = predict(s_lm, data.frame(Yards, elevation, windspeed)),
+         s_over_exp = s - s_pred) %>%  
+  ggplot(aes(x = make_x, y = make_y)) + 
+    geom_segment(aes(x = -9.25, y = 0, xend = 9.25, yend = 0), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = 0, y = 0, xend = 0, yend = -10), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = -9.25, y = 0, xend = -9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    geom_segment(aes(x = 9.25, y = 0, xend = 9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    geom_point(aes(color = s_over_exp)) + 
+    scale_color_gradient(low = 'magenta', high = 'green') +
+    labs(x = '', y = '', title = 'Best: Graham Gano') + 
+    theme_minimal() + 
+    xlim(c(-20, 20)) +
+    ylim(c(-10, 40)) +
+    guides(color = "none")
+
+splot_2 = final %>%
+  filter(Kicker == 'G. Zuerlein') %>%
+  mutate(xs = 1 - sigmoid(abs(make_x), .6, 6),
+         ys = sigmoid(make_y, .25, 7.5),
+         s = pmin(xs, ys),
+         s_pred = predict(s_lm, data.frame(Yards, elevation, windspeed)),
+         s_over_exp = s - s_pred) %>%  
+  ggplot(aes(x = make_x, y = make_y)) + 
+    geom_segment(aes(x = -9.25, y = 0, xend = 9.25, yend = 0), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = 0, y = 0, xend = 0, yend = -10), colour = "gold2", linewidth = 1.2) +  
+    geom_segment(aes(x = -9.25, y = 0, xend = -9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    geom_segment(aes(x = 9.25, y = 0, xend = 9.25, yend = 35), colour = "gold2", linewidth = 1.2) + 
+    geom_point(aes(color = s_over_exp)) + 
+    scale_color_gradient(low = 'magenta', high = 'green') +
+    labs(x = '', y = '', title = 'Worst: Greg Zuerlein') + 
+    theme_minimal() + 
+    xlim(c(-20, 20)) +
+    ylim(c(-10, 40)) +
+    guides(color = "none")
+
+grid_layout = splot_1 + splot_2 + plot_layout(ncol = 2, nrow = 1)
+grid_layout
+
+ggsave("jason_myers.png", splot_1, width = 4, height = 6)
+ggsave("will_lutz.png", splot_2, width = 4, height = 6)
+```
+
+
+### Further Study
+
+#### Stadiums
+In order to determine which stadiums are easier or harder to kick in, I used a 'score over expected' measure based on the same model from earlier ($\text{Actual Score} - \text{Predicted Score}$). I did not use a volume adjustment here, so there was no need for the difficulty multiplier from earlier. The graph below displays the stadiums that had the least and greatest average score over expected throughout the season (with the international stadiums filtered out). Observe how highly the Ravens and Seahawks rank here; this is likely due to Justin Tucker's and Jason Myers' influence. 
+```{r, cache=TRUE}
+zones_loc = zones %>%
+  mutate(s_pred = predict(s_lm, data.frame(Yards, elevation, windspeed)),
+         s_over_exp = s - s_pred) %>%
+  group_by(stadium) %>%
+  filter(n() > 11) %>%
+  summarise(s_over_exp = mean(s_over_exp)) %>%
+  arrange(-s_over_exp)
+```
+
+```{r, cache=TRUE, echo=FALSE}
+zones_loc %>% ggplot(aes(x = reorder(stadium, s_over_exp), y = s_over_exp)) + 
+                geom_bar(stat = 'identity', aes(fill = s_over_exp)) +
+                scale_fill_gradient(low = "red", high = "chartreuse4") +
+                theme(axis.text.x = element_text(angle = 55, hjust = 1)) +
+                labs(title = "Average Score Over Expected By Stadium", 
+                     x = "Home Team of Stadium", 
+                     y = "Score Over Expected") +
+                theme(legend.position = "none")
+```
+
+A better way to measure this would be to factor in the ability of the kicker who is attempting the kicks. Using the models from before, I measured each kicker's average difficulty-adjusted score and subtracted that from the actual difficulty-adjusted score of each kick. This levels the playing field and identifies stadiums that are more favorable to kick in. Notice that the top 2 stadiums are domes, and the 3rd is the highest elevation stadium in the NFL.
+```{r, cache=TRUE}
+kicker_s = zones %>% 
+  group_by(Kicker) %>%
+  summarize(kicker_s = mean(s_adj))
+
+zones_loc = zones %>%
+  left_join(kicker_s, by = 'Kicker') %>%
+  mutate(s_over_exp_per_kicker = s_adj - kicker_s) %>%
+  group_by(stadium) %>%
+  filter(n() > 11) %>%
+  summarise(s_over_exp_per_kicker = mean(s_over_exp_per_kicker)) %>%
+  arrange(-s_over_exp_per_kicker)
+```
+
+
+```{r, cache=TRUE, echo=FALSE}
+zones_loc %>% ggplot(aes(x = reorder(stadium, s_over_exp_per_kicker), y = s_over_exp_per_kicker)) + 
+                geom_bar(stat = 'identity', aes(fill = s_over_exp_per_kicker)) +
+                scale_fill_gradient(low = "red", high = "chartreuse4") +
+                theme(axis.text.x = element_text(angle = 55, hjust = 1)) +
+                labs(title = "Average Score Over Expected By Stadium (adjusted for kicker skill)", 
+                     x = "Home Team of Stadium", 
+                     y = "Score Over Expected") +
+                theme(legend.position = "none")
+```
+
+```{r, cache=TRUE, echo = FALSE}
+final_with_score = final %>%
+  mutate(xs = 1 - sigmoid(abs(make_x), .6, 6),
+         ys = sigmoid(make_y, .25, 7.5),
+         s = pmin(xs, ys),
+         s_pred = predict(s_lm, data.frame(Yards, elevation, windspeed)),
+         s_over_exp = s - s_pred)
+
+write.csv(final_with_score, "final_kick_data_with_score_2022.csv", row.names = FALSE)
+```
+
